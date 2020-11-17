@@ -120,7 +120,7 @@ class AuxMemory(Dataset):
     def clear_memory(self):
         del self.states[:]
 
-class Distributions():
+class Continous():
     def sample(self, mean, std):
         distribution    = Normal(mean, std)
         return distribution.sample().float().to(device)
@@ -169,6 +169,73 @@ class PolicyFunction():
             
         return torch.stack(adv)
 
+class TrulyPPO():
+    def __init__(self, policy_kl_range, policy_params, value_clip, vf_loss_coef, entropy_coef, gamma, lam):
+        self.policy_kl_range    = policy_kl_range
+        self.policy_params      = policy_params
+        self.value_clip         = value_clip
+        self.vf_loss_coef       = vf_loss_coef
+        self.entropy_coef       = entropy_coef
+
+        self.distributions      = Continous()
+        self.policy_function    = PolicyFunction(gamma, lam)
+
+    def compute_loss(self, action_mean, action_std, old_action_mean, old_action_std, values, old_values, next_values, actions, rewards, dones):    
+        # Don't use old value in backpropagation
+        Old_values          = old_values.detach()
+        Old_action_mean     = old_action_mean.detach()
+
+        # Getting general advantages estimator and returns
+        Advantages      = self.policy_function.generalized_advantage_estimation(values, rewards, next_values, dones)
+        Returns         = (Advantages + values).detach()
+        Advantages      = ((Advantages - Advantages.mean()) / (Advantages.std() + 1e-6)).detach() 
+
+        # Finding the ratio (pi_theta / pi_theta__old):      
+        logprobs        = self.distributions.logprob(action_mean, action_std, actions)
+        Old_logprobs    = self.distributions.logprob(Old_action_mean, old_action_std, actions).detach() 
+
+        # Finding Surrogate Loss
+        ratios          = (logprobs - Old_logprobs).exp() # ratios = old_logprobs / logprobs        
+        Kl              = self.distributions.kl_divergence(Old_action_mean, old_action_std, action_mean, action_std)
+
+        pg_targets  = torch.where(
+            (Kl >= self.policy_kl_range) & (ratios > 1),
+            ratios * Advantages - self.policy_params * Kl,
+            ratios * Advantages
+        )
+        pg_loss     = pg_targets.mean()
+
+        # Getting entropy from the action probability 
+        dist_entropy    = self.distributions.entropy(action_mean, action_std).mean()
+
+        # Getting Critic loss by using Clipped critic value
+        if self.value_clip is None:
+            critic_loss   = ((Returns - values).pow(2) * 0.5).mean()
+        else:
+            vpredclipped  = old_values + torch.clamp(values - Old_values, -self.value_clip, self.value_clip) # Minimize the difference between old value and new value
+            vf_losses1    = (Returns - values).pow(2) * 0.5 # Mean Squared Error
+            vf_losses2    = (Returns - vpredclipped).pow(2) * 0.5 # Mean Squared Error        
+            critic_loss   = torch.max(vf_losses1, vf_losses2).mean()                
+
+        # We need to maximaze Policy Loss to make agent always find Better Rewards
+        # and minimize Critic Loss 
+        loss = (critic_loss * self.vf_loss_coef) - (dist_entropy * self.entropy_coef) - pg_loss
+        return loss
+
+class JointAux():
+    def __init__(self):
+        self.distributions  = Continous()
+
+    def compute_loss(self, action_mean, action_std, old_action_mean, old_action_std, values, Returns):
+        # Don't use old value in backpropagation
+        Old_action_mean     = old_action_mean.detach()
+
+        # Finding KL Divergence                
+        Kl              = self.distributions.kl_divergence(Old_action_mean, old_action_std, action_mean, action_std).mean()
+        aux_loss        = ((Returns - values).pow(2) * 0.5).mean()
+
+        return aux_loss + Kl
+
 class Agent():  
     def __init__(self, state_dim, action_dim, is_training_mode, policy_kl_range, policy_params, value_clip, entropy_coef, vf_loss_coef,
                  batchsize, PPO_epochs, gamma, lam, learning_rate):        
@@ -192,10 +259,12 @@ class Agent():
         self.value_optimizer    = Adam(self.value.parameters(), lr = learning_rate)
 
         self.policy_memory      = PolicyMemory()
-        self.aux_memory         = AuxMemory()
+        self.policy_loss        = TrulyPPO(policy_kl_range, policy_params, value_clip, vf_loss_coef, entropy_coef, gamma, lam)
 
-        self.policy_function    = PolicyFunction(gamma, lam)  
-        self.distributions      = Distributions()
+        self.aux_memory         = AuxMemory()
+        self.aux_loss           = JointAux()
+         
+        self.distributions      = Continous()
 
         if is_training_mode:
           self.policy.train()
@@ -221,60 +290,6 @@ class Agent():
               
         return action.squeeze(0).cpu().numpy()
 
-    # Loss for PPO
-    def get_policy_loss(self, action_mean, values, old_action_mean, old_values, next_values, actions, rewards, dones):
-        # Don't use old value in backpropagation
-        Old_action_mean     = old_action_mean.detach()
-        Old_values          = old_values.detach()
-
-        # Getting general advantages estimator
-        Advantages      = self.policy_function.generalized_advantage_estimation(values, rewards, next_values, dones)
-        Returns         = (Advantages + values).detach()
-        Advantages      = ((Advantages - Advantages.mean()) / (Advantages.std() + 1e-6)).detach()
-
-        # Finding the ratio (pi_theta / pi_theta__old):        
-        logprobs        = self.distributions.logprob(action_mean, self.std, actions)
-        Old_logprobs    = self.distributions.logprob(Old_action_mean, self.std, actions).detach()
-        ratios          = (logprobs - Old_logprobs).exp() # ratios = old_logprobs / logprobs
-
-        # Finding KL Divergence                
-        Kl              = self.distributions.kl_divergence(Old_action_mean, self.std, action_mean, self.std)
-
-        # Combining TR-PPO with Rollback (Truly PPO)
-        pg_loss         = torch.where(
-                (Kl >= self.policy_kl_range) & (ratios > 1),
-                ratios * Advantages - self.policy_params * Kl,
-                ratios * Advantages
-        ) 
-        pg_loss         = pg_loss.mean()
-
-        # Getting entropy from the action probability 
-        dist_entropy    = self.distributions.entropy(action_mean, self.std).mean()
-
-        # Getting critic loss by using Clipped critic value
-        vpredclipped    = old_values + torch.clamp(values - Old_values, -self.value_clip, self.value_clip) # Minimize the difference between old value and new value
-        vf_losses1      = (Returns - values).pow(2) * 0.5 # Mean Squared Error
-        vf_losses2      = (Returns - vpredclipped).pow(2) * 0.5 # Mean Squared Error        
-        critic_loss     = torch.max(vf_losses1, vf_losses2).mean()                
-
-        # We need to maximaze Policy Loss to make agent always find Better Rewards
-        # and minimize Critic Loss 
-        loss            = (critic_loss * self.vf_loss_coef) - (dist_entropy * self.entropy_coef) - pg_loss
-        return loss
-        
-    def get_aux_loss(self, action_mean, values, old_action_mean, Returns):
-        # Don't use old value in backpropagation
-        Old_action_mean    = old_action_mean.detach()
-
-        # Finding KL Divergence                
-        Kl              = self.distributions.kl_divergence(Old_action_mean, self.std, action_mean, self.std).mean()
-        aux_loss        = ((Returns - values).pow(2) * 0.5).mean()
-
-        return aux_loss + Kl
-
-    def get_value_loss(self, values, Returns):
-        return ((Returns - values).pow(2) * 0.5).mean()
-
     # Get loss and Do backpropagation
     def training_ppo(self, states, actions, rewards, dones, next_states):
         action_mean, _      = self.policy(states)
@@ -283,7 +298,7 @@ class Agent():
         old_values          = self.value_old(states)
         next_values         = self.value(next_states)
 
-        loss                = self.get_policy_loss(action_mean, values, old_action_mean, old_values, next_values, actions, rewards, dones)
+        loss                = self.policy_loss.compute_loss(action_mean, self.std, old_action_mean, self.std, values, old_values, next_values, actions, rewards, dones)
 
         self.policy_optimizer.zero_grad()
         self.value_optimizer.zero_grad()
@@ -299,7 +314,7 @@ class Agent():
         action_mean, values             = self.policy(states)
         old_action_mean, _              = self.policy_old(states)
 
-        joint_loss                      = self.get_aux_loss(action_mean, values, old_action_mean, Returns)
+        joint_loss                      = self.aux_loss.compute_loss(action_mean, self.std, old_action_mean, self.std, values, Returns)
 
         self.policy_optimizer.zero_grad()
         joint_loss.backward()
@@ -357,6 +372,66 @@ class Agent():
         self.value.load_state_dict(value_checkpoint['model_state_dict'])
         self.value_optimizer.load_state_dict(value_checkpoint['optimizer_state_dict'])
 
+class Runner():
+    def __init__(self, env, agent, render, training_mode, n_update, n_aux_update, max_action):
+        self.env = env
+        self.agent = agent
+        self.render = render
+        self.training_mode = training_mode
+        self.n_update = n_update
+        self.n_aux_update = n_aux_update
+        self.max_action = max_action
+
+        self.t_updates = 0
+        self.t_aux_updates = 0
+
+    def run_episode(self):
+        ############################################
+        state = self.env.reset()    
+        done = False
+        total_reward = 0
+        eps_time = 0
+        ############################################ 
+        for _ in range(1, 5000):
+            action = self.agent.act(state) 
+
+            action_gym = np.clip(action, -1.0, 1.0) * self.max_action
+            next_state, reward, done, _ = self.env.step(action_gym)
+
+            eps_time += 1 
+            self.t_updates += 1
+            total_reward += reward
+            
+            if self.training_mode:
+                self.agent.policy_memory.save_eps(state.tolist(), action.tolist(), reward, float(done), next_state.tolist()) 
+                
+            state = next_state
+                    
+            if self.render:
+                self.env.render()
+            
+            if self.training_mode and self.n_update is not None and self.t_updates == self.n_update:
+                self.agent.update_ppo()
+                self.t_updates = 0
+                self.t_aux_updates += 1
+
+                if self.t_aux_updates == self.n_aux_update:
+                    self.agent.update_aux()
+                    self.t_aux_updates = 0
+
+            if done: 
+                break                
+        
+        if self.training_mode and self.n_update is None:
+            self.agent.update_ppo()
+            self.t_aux_updates += 1
+
+            if self.t_aux_updates == self.n_aux_update:
+                self.agent.update_aux()
+                self.t_aux_updates = 0
+                    
+        return total_reward, eps_time
+
 def plot(datas):
     print('----------')
 
@@ -369,43 +444,6 @@ def plot(datas):
     print('Max :', np.max(datas))
     print('Min :', np.min(datas))
     print('Avg :', np.mean(datas))
-
-def run_episode(env, agent, state_dim, render, training_mode, t_updates, n_update, t_aux_updates, n_aux_update):
-    ############################################
-    state           = env.reset()
-    done            = False
-    total_reward    = 0
-    eps_time        = 0
-    ############################################
-    
-    while not done:
-        action                      = agent.act(state)
-        next_state, reward, done, _ = env.step(action)
-        
-        eps_time        += 1 
-        t_updates       += 1
-        total_reward    += reward
-
-        if training_mode:
-            agent.save_eps(state.tolist(), action, float(reward), float(done), next_state.tolist()) 
-            
-        state   = next_state
-                
-        if render:
-            env.render()
-        
-        if training_mode:
-            if t_updates % n_update == 0:
-                agent.update_ppo()
-                t_updates = 0
-                t_aux_updates += 1
-
-                if t_aux_updates % n_aux_update == 0:
-                    agent.update_aux()
-                    t_aux_updates = 0
-        
-        if done:           
-            return total_reward, eps_time, t_updates, t_aux_updates
 
 def main():
     ############## Hyperparameters ##############
@@ -429,6 +467,7 @@ def main():
     batchsize           = 32 # How many batch per update. size of batch = n_update / batchsize. Rocommended set to 4 for Discrete
     PPO_epochs          = 10 # How many epoch per update
     n_aux_update        = 5
+    max_action          = 1.0
     
     gamma               = 0.99 # Just set to 0.99
     lam                 = 0.95 # Just set to 0.95
@@ -442,6 +481,8 @@ def main():
 
     agent               = Agent(state_dim, action_dim, training_mode, policy_kl_range, policy_params, value_clip, entropy_coef, vf_loss_coef,
                             batchsize, PPO_epochs, gamma, lam, learning_rate)  
+
+    runner              = Runner(env, agent, render, training_mode, n_update, n_aux_update, max_action)
     #############################################     
     if using_google_drive:
         from google.colab import drive
@@ -458,11 +499,9 @@ def main():
     times               = []
     batch_times         = []
 
-    t_updates           = 0
-    t_aux_updates       = 0
-
     for i_episode in range(1, n_episode + 1):
-        total_reward, time, t_updates, t_aux_updates = run_episode(env, agent, state_dim, render, training_mode, t_updates, n_update, t_aux_updates, n_aux_update)
+        total_reward, time = runner.run_episode()
+
         print('Episode {} \t t_reward: {} \t time: {} \t '.format(i_episode, total_reward, time))
         batch_rewards.append(int(total_reward))
         batch_times.append(time)        
