@@ -1,61 +1,46 @@
 import gym
 from gym.envs.registration import register
     
-import torch
-import torch.nn as nn
-from torch.distributions import Categorical
-from torch.distributions.kl import kl_divergence
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import Adam
+import tensorflow as tf
+import tensorflow_probability as tfp
+from tensorflow.keras.layers import Dense
+from tensorflow.keras import Model
 
 import matplotlib.pyplot as plt
 import numpy as np
 import sys
 import numpy
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  
-dataType = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-
-class Policy_Model(nn.Module):
+class Policy_Model(Model):
     def __init__(self, state_dim, action_dim):
         super(Policy_Model, self).__init__()
 
-        self.nn_layer = nn.Sequential(
-                nn.Linear(state_dim, 128),
-                nn.ReLU(),
-                nn.Linear(128, 128),
-                nn.ReLU()
-              ).float().to(device)
+        self.d1     = Dense(128, activation='relu')
+        self.d2     = Dense(128, activation='relu')
 
-        self.actor_layer = nn.Sequential(
-                nn.Linear(128, action_dim),
-                nn.Softmax(-1)
-              ).float().to(device)
-
-        self.critic_layer = nn.Sequential(
-                nn.Linear(128, 1)
-              ).float().to(device)
+        self.actor  = Dense(action_dim, activation='softmax')
+        self.critic = Dense(action_dim, activation='linear')
         
-    def forward(self, states):
-        x = self.nn_layer(states)
-        return self.actor_layer(x), self.critic_layer(x)
+    def call(self, states):
+        x = self.d1(states)
+        x = self.d2(x)
+        return self.actor(x), self.critic(x)
 
-class Value_Model(nn.Module):
+class Value_Model(Model):
     def __init__(self, state_dim, action_dim):
         super(Value_Model, self).__init__()   
 
-        self.nn_layer = nn.Sequential(
-                nn.Linear(state_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, 64),
-                nn.ReLU(),
-                nn.Linear(64, 1)
-              ).float().to(device)
-        
-    def forward(self, states):
-        return self.nn_layer(states)
+        self.d1     = Dense(64, activation='relu')
+        self.d2     = Dense(64, activation='relu')
 
-class PolicyMemory(Dataset):
+        self.critic = Dense(action_dim, activation='linear')
+        
+    def call(self, states):
+        x = self.d1(states)
+        x = self.d2(x)
+        return self.critic(x)
+
+class PolicyMemory():
     def __init__(self):
         self.actions        = [] 
         self.states         = []
@@ -66,19 +51,24 @@ class PolicyMemory(Dataset):
     def __len__(self):
         return len(self.dones)
 
-    def __getitem__(self, idx):
-        return np.array(self.states[idx], dtype = np.float32), np.array(self.actions[idx], dtype = np.float32), \
-            np.array([self.rewards[idx]], dtype = np.float32), np.array([self.dones[idx]], dtype = np.float32), np.array(self.next_states[idx], dtype = np.float32)      
+    def get_all_tensor(self):
+        states = tf.constant(self.states, dtype = tf.float32)
+        actions = tf.constant(self.actions, dtype = tf.float32)
+        rewards = tf.expand_dims(tf.constant(self.rewards, dtype = tf.float32), 1)
+        dones = tf.expand_dims(tf.constant(self.dones, dtype = tf.float32), 1)
+        next_states = tf.constant(self.next_states, dtype = tf.float32)
+        
+        return tf.data.Dataset.from_tensor_slices((states, actions, rewards, dones, next_states))
 
     def get_all(self):
-        return self.states, self.actions, self.rewards, self.dones, self.next_states
-    
+        return self.states, self.actions, self.rewards, self.dones, self.next_states     
+
     def save_eps(self, state, action, reward, done, next_state):
         self.rewards.append(reward)
         self.states.append(state)
         self.actions.append(action)
         self.dones.append(done)
-        self.next_states.append(next_state)
+        self.next_states.append(next_state)        
 
     def clear_memory(self):
         del self.actions[:]
@@ -87,15 +77,16 @@ class PolicyMemory(Dataset):
         del self.dones[:]
         del self.next_states[:]
 
-class AuxMemory(Dataset):
+class AuxMemory():
     def __init__(self):
         self.states = []
 
     def __len__(self):
         return len(self.states)
 
-    def __getitem__(self, idx):
-        return np.array(self.states[idx], dtype = np.float32)
+    def get_all_tensor(self):
+        states = tf.constant(self.states, dtype = tf.float32)        
+        return tf.data.Dataset.from_tensor_slices(states)
 
     def save_all(self, states):
         self.states = self.states + states
@@ -105,22 +96,22 @@ class AuxMemory(Dataset):
 
 class Discrete():
     def sample(self, datas):
-        distribution = Categorical(datas)
-        return distribution.sample().float().to(device)
+        distribution = tfp.distributions.Categorical(probs = datas)
+        return distribution.sample()
         
     def entropy(self, datas):
-        distribution = Categorical(datas)    
-        return distribution.entropy().float().to(device)
+        distribution = tfp.distributions.Categorical(probs = datas)            
+        return distribution.entropy()
       
     def logprob(self, datas, value_data):
-        distribution = Categorical(datas)
-        return distribution.log_prob(value_data).unsqueeze(1).float().to(device)
+        distribution = tfp.distributions.Categorical(probs = datas)
+        return tf.expand_dims(distribution.log_prob(value_data), 1)
 
     def kl_divergence(self, datas1, datas2):
-        distribution1 = Categorical(datas1)
-        distribution2 = Categorical(datas2)
+        distribution1 = tfp.distributions.Categorical(probs = datas1)
+        distribution2 = tfp.distributions.Categorical(probs = datas2)
 
-        return kl_divergence(distribution1, distribution2).unsqueeze(1).float().to(device)  
+        return tf.expand_dims(tfp.distributions.kl_divergence(distribution1, distribution2), 1)
 
 class PolicyFunction():
     def __init__(self, gamma = 0.99, lam = 0.95):
@@ -135,7 +126,7 @@ class PolicyFunction():
             running_add = rewards[step] + (1.0 - dones[step]) * self.gamma * running_add
             returns.insert(0, running_add)
             
-        return torch.stack(returns)
+        return tf.stack(returns)
       
     def temporal_difference(self, reward, next_value, done):
         q_values = reward + (1 - done) * self.gamma * next_value           
@@ -150,7 +141,7 @@ class PolicyFunction():
             gae = delta[step] + (1.0 - dones[step]) * self.gamma * self.lam * gae
             adv.insert(0, gae)
             
-        return torch.stack(adv)
+        return tf.stack(adv)
 
 class TrulyPPO():
     def __init__(self, policy_kl_range, policy_params, value_clip, vf_loss_coef, entropy_coef, gamma, lam):
@@ -166,44 +157,42 @@ class TrulyPPO():
     # Loss for PPO  
     def compute_loss(self, action_probs, old_action_probs, values, old_values, next_values, actions, rewards, dones):
         # Don't use old value in backpropagation
-        Old_values          = old_values.detach()
-        Old_action_probs    = old_action_probs.detach()     
+        Old_values          = tf.stop_gradient(old_values)
+        Old_action_probs    = tf.stop_gradient(old_action_probs)
 
-        # Getting general advantages estimator and returns
+        # Getting general advantages estimator
         Advantages      = self.policy_function.generalized_advantage_estimation(values, rewards, next_values, dones)
-        Returns         = (Advantages + values).detach()
-        Advantages      = ((Advantages - Advantages.mean()) / (Advantages.std() + 1e-6)).detach()
+        Returns         = tf.stop_gradient(Advantages + values)
+        Advantages      = tf.stop_gradient((Advantages - tf.math.reduce_mean(Advantages)) / (tf.math.reduce_std(Advantages) + 1e-6))
 
-        # Finding the ratio (pi_theta / pi_theta__old): 
+        # Finding the ratio (pi_theta / pi_theta__old):        
         logprobs        = self.distributions.logprob(action_probs, actions)
-        Old_logprobs    = self.distributions.logprob(Old_action_probs, actions).detach()
+        Old_logprobs    = tf.stop_gradient(self.distributions.logprob(Old_action_probs, actions))
+        ratios          = tf.math.exp(logprobs - Old_logprobs) # ratios = old_logprobs / logprobs
 
-        # Finding Surrogate Loss
-        ratios          = (logprobs - Old_logprobs).exp() # ratios = old_logprobs / logprobs        
-        Kl              = self.distributions.kl_divergence(old_action_probs, action_probs)
+        # Finding KL Divergence                
+        Kl              = self.distributions.kl_divergence(Old_action_probs, action_probs)
 
-        pg_targets  = torch.where(
-            (Kl >= self.policy_kl_range) & (ratios > 1),
-            ratios * Advantages - self.policy_params * Kl,
-            ratios * Advantages
+        # Combining TR-PPO with Rollback (Truly PPO)
+        pg_loss         = tf.where(
+                tf.logical_and(Kl >= self.policy_kl_range, ratios > 1),
+                ratios * Advantages - self.policy_params * Kl,
+                ratios * Advantages
         )
-        pg_loss     = pg_targets.mean()
+        pg_loss         = tf.math.reduce_mean(pg_loss)
 
-        # Getting Entropy from the action probability 
-        dist_entropy    = self.distributions.entropy(action_probs).mean()
+        # Getting entropy from the action probability
+        dist_entropy    = tf.math.reduce_mean(self.distributions.entropy(action_probs))
 
-        # Getting Critic loss by using Clipped critic value
-        if self.value_clip is None:
-            critic_loss   = ((Returns - values).pow(2) * 0.5).mean()
-        else:
-            vpredclipped  = old_values + torch.clamp(values - Old_values, -self.value_clip, self.value_clip) # Minimize the difference between old value and new value
-            vf_losses1    = (Returns - values).pow(2) * 0.5 # Mean Squared Error
-            vf_losses2    = (Returns - vpredclipped).pow(2) * 0.5 # Mean Squared Error        
-            critic_loss   = torch.max(vf_losses1, vf_losses2).mean() 
+        # Getting critic loss by using Clipped critic value
+        vpredclipped    = old_values + tf.clip_by_value(values - Old_values, -self.value_clip, self.value_clip) # Minimize the difference between old value and new value
+        vf_losses1      = tf.math.square(Returns - values) * 0.5 # Mean Squared Error
+        vf_losses2      = tf.math.square(Returns - vpredclipped) * 0.5 # Mean Squared Error
+        critic_loss     = tf.math.reduce_mean(tf.math.maximum(vf_losses1, vf_losses2))           
 
         # We need to maximaze Policy Loss to make agent always find Better Rewards
         # and minimize Critic Loss 
-        loss = (critic_loss * self.vf_loss_coef) - (dist_entropy * self.entropy_coef) - pg_loss
+        loss            = (critic_loss * self.vf_loss_coef) - (dist_entropy * self.entropy_coef) - pg_loss
         return loss
 
 class JointAux():
@@ -212,11 +201,11 @@ class JointAux():
 
     def compute_loss(self, action_probs, old_action_probs, values, Returns):
         # Don't use old value in backpropagation
-        Old_action_probs    = old_action_probs.detach()
+        Old_action_probs    = tf.stop_gradient(old_action_probs)
 
         # Finding KL Divergence                
-        Kl              = self.distributions.kl_divergence(Old_action_probs, action_probs).mean()
-        aux_loss        = ((Returns - values).pow(2) * 0.5).mean()
+        Kl              = tf.math.reduce_mean(self.distributions.kl_divergence(Old_action_probs, action_probs))
+        aux_loss        = tf.math.reduce_mean(tf.math.square(Returns - values) * 0.5)
 
         return aux_loss + Kl
 
@@ -235,11 +224,9 @@ class Agent():
 
         self.policy             = Policy_Model(state_dim, action_dim)
         self.policy_old         = Policy_Model(state_dim, action_dim)
-        self.policy_optimizer   = Adam(self.policy.parameters(), lr = learning_rate)
 
         self.value              = Value_Model(state_dim, action_dim)
         self.value_old          = Value_Model(state_dim, action_dim)
-        self.value_optimizer    = Adam(self.value.parameters(), lr = learning_rate)
 
         self.policy_memory      = PolicyMemory()
         self.policy_loss        = TrulyPPO(policy_kl_range, policy_params, value_clip, vf_loss_coef, entropy_coef, gamma, lam)
@@ -247,20 +234,14 @@ class Agent():
         self.aux_memory         = AuxMemory()
         self.aux_loss           = JointAux()
          
+        self.optimizer          = tf.keras.optimizers.Adam(learning_rate = learning_rate)
         self.distributions      = Discrete()        
-
-        if is_training_mode:
-          self.policy.train()
-          self.value.train()
-        else:
-          self.policy.eval()
-          self.value.eval()
 
     def save_eps(self, state, action, reward, done, next_state):
         self.policy_memory.save_eps(state, action, reward, done, next_state)
 
     def act(self, state):
-        state           = torch.FloatTensor(state).unsqueeze(0).to(device).detach()
+        state           = tf.expand_dims(tf.cast(state, dtype = tf.float32), 0)
         action_probs, _ = self.policy(state)
 
         # We don't need sample the action in Test Mode
@@ -269,49 +250,43 @@ class Agent():
             # Sample the action
             action  = self.distributions.sample(action_probs) 
         else:
-            action  = torch.argmax(action_probs, 1)  
+            action  = tf.math.argmax(action_probs, 1)
               
-        return action.cpu().item()
+        return action
 
     # Get loss and Do backpropagation
+    @tf.function
     def training_ppo(self, states, actions, rewards, dones, next_states):
-        action_probs, _     = self.policy(states)
-        values              = self.value(states)
-        old_action_probs, _ = self.policy_old(states)
-        old_values          = self.value_old(states)
-        next_values         = self.value(next_states)
+        with tf.GradientTape() as tape:
+            action_probs, _     = self.policy(states)
+            values              = self.value(states)
+            old_action_probs, _ = self.policy_old(states)
+            old_values          = self.value_old(states)
+            next_values         = self.value(next_states)
 
-        loss                = self.policy_loss.compute_loss(action_probs, old_action_probs, values, old_values, next_values, actions, rewards, dones)
+            loss                = self.policy_loss.compute_loss(action_probs, old_action_probs, values, old_values, next_values, actions, rewards, dones)
 
-        self.policy_optimizer.zero_grad()
-        self.value_optimizer.zero_grad()
+        gradients = tape.gradient(loss, self.policy.trainable_variables + self.value.trainable_variables)        
+        self.optimizer.apply_gradients(zip(gradients, self.policy.trainable_variables + self.value.trainable_variables))
 
-        loss.backward()
-
-        self.policy_optimizer.step()
-        self.value_optimizer.step()
-
+    @tf.function
     def training_aux(self, states):
-        Returns                         = self.value(states).detach()
+        Returns                             = tf.stop_gradient(self.value(states))
 
-        action_probs, values            = self.policy(states)
-        old_action_probs, _             = self.policy_old(states)
+        with tf.GradientTape() as tape:
+            action_probs, values            = self.policy(states)
+            old_action_probs, _             = self.policy_old(states)
 
-        joint_loss                      = self.aux_loss.compute_loss(action_probs, old_action_probs, values, Returns)
+            joint_loss                      = self.aux_loss.compute_loss(action_probs, old_action_probs, values, Returns)
 
-        self.policy_optimizer.zero_grad()
-        joint_loss.backward()
-        self.policy_optimizer.step()
+        gradients = tape.gradient(joint_loss, self.policy.trainable_variables)        
+        self.optimizer.apply_gradients(zip(gradients, self.policy.trainable_variables))
 
     # Update the model
     def update_ppo(self):
-        dataloader  = DataLoader(self.policy_memory, self.batchsize, shuffle = False)
-
-        # Optimize policy for K epochs:        
-        for _ in range(self.PPO_epochs):
-            for states, actions, rewards, dones, next_states in dataloader:
-                self.training_ppo(states.float().to(device), actions.float().to(device), \
-                    rewards.float().to(device), dones.float().to(device), next_states.float().to(device))
+        for _ in range(self.PPO_epochs):       
+            for states, actions, rewards, dones, next_states in self.policy_memory.get_all_tensor().batch(self.batchsize):
+                self.training_ppo(states, actions, rewards, dones, next_states)
 
         # Clear the memory
         states, _, _, _, _ = self.policy_memory.get_all()
@@ -319,42 +294,28 @@ class Agent():
         self.policy_memory.clear_memory()
 
         # Copy new weights into old policy:
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        self.value_old.load_state_dict(self.value.state_dict())
+        self.policy_old.set_weights(self.policy.get_weights())
+        self.value_old.set_weights(self.value.get_weights())
 
     def update_aux(self):
-        dataloader  = DataLoader(self.aux_memory, self.batchsize, shuffle = False)
-
         # Optimize policy for K epochs:
         for _ in range(self.PPO_epochs): 
-            for states in dataloader:
-                self.training_aux(states.float().to(device))
+            for states in self.aux_memory.get_all_tensor().batch(self.batchsize):
+                self.training_aux(states)
 
         # Clear the memory
         self.aux_memory.clear_memory()
 
         # Copy new weights into old policy:
-        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.policy_old.set_weights(self.policy.get_weights())
 
     def save_weights(self):
-        torch.save({
-            'model_state_dict': self.policy.state_dict(),
-            'optimizer_state_dict': self.policy_optimizer.state_dict()
-            }, 'SlimeVolley/policy.tar')
-        
-        torch.save({
-            'model_state_dict': self.value.state_dict(),
-            'optimizer_state_dict': self.value_optimizer.state_dict()
-            }, 'SlimeVolley/value.tar')
+        self.policy.save_weights('bipedalwalker_w/policy_ppo', save_format='tf')
+        self.value.save_weights('bipedalwalker_w/critic_ppo', save_format='tf')
         
     def load_weights(self):
-        policy_checkpoint = torch.load('SlimeVolley/policy.tar')
-        self.policy.load_state_dict(policy_checkpoint['model_state_dict'])
-        self.policy_optimizer.load_state_dict(policy_checkpoint['optimizer_state_dict'])
-
-        value_checkpoint = torch.load('SlimeVolley/value.tar')
-        self.value.load_state_dict(value_checkpoint['model_state_dict'])
-        self.value_optimizer.load_state_dict(value_checkpoint['optimizer_state_dict'])
+        self.policy.load_weights('bipedalwalker_w/policy_ppo')
+        self.value.load_weights('bipedalwalker_w/value_ppo')
 
 class Runner():
     def __init__(self, env, agent, render, training_mode, n_update, n_aux_update):
