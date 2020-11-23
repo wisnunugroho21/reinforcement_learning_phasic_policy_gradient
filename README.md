@@ -1,7 +1,7 @@
 # Phasic Policy Gradient
 
 Simple code to demonstrate Deep Reinforcement Learning by using Phasic Policy Gradient in Pytorch & Tensorflow.
-There are some modification on this code, which may be have many differences than original implementation
+There are some modification on this code, which may have many differences than original implementation
 
 The code is use newer version of PPO called Truly PPO (instead of PPO Clip), which has more sample efficiency and performance than PPO Clip. 
 
