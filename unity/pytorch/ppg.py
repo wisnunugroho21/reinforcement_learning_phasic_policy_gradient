@@ -7,14 +7,14 @@ from torch.distributions import Normal
 from torch.distributions.kl import kl_divergence
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
-from torch.utils.tensorboard import SummaryWriter
 
 import matplotlib.pyplot as plt
 import numpy as np
 import sys
 import numpy
-import time
-import datetime
+
+from mlagents_envs.registry import default_registry
+from mlagents_envs.environment import UnityEnvironment
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  
 dataType = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
@@ -251,7 +251,7 @@ class Agent():
         self.PPO_epochs         = PPO_epochs
         self.is_training_mode   = is_training_mode
         self.action_dim         = action_dim
-        self.std                = torch.ones([1, action_dim]).float().to(device)
+        self.std                = torch.ones([1, action_dim]).float().to(device) * 0.5
 
         self.policy             = Policy_Model(state_dim, action_dim)
         self.policy_old         = Policy_Model(state_dim, action_dim)
@@ -261,10 +261,7 @@ class Agent():
         self.value_old          = Value_Model(state_dim, action_dim)
         self.value_optimizer    = Adam(self.value.parameters(), lr = learning_rate)
 
-        self.policy_memory      = PolicyMemory()
         self.policy_loss        = TrulyPPO(policy_kl_range, policy_params, value_clip, vf_loss_coef, entropy_coef, gamma, lam)
-
-        self.aux_memory         = AuxMemory()
         self.aux_loss           = JointAux()
          
         self.distributions      = Continous()
@@ -275,12 +272,6 @@ class Agent():
         else:
           self.policy.eval()
           self.value.eval()
-
-    def save_eps(self, state, action, reward, done, next_state):
-        self.policy_memory.save_eps(state, action, reward, done, next_state)
-
-    def save_all(self, states, actions, rewards, dones, next_states):
-        self.policy_memory.save_all(states, actions, rewards, dones, next_states)
 
     def act(self, state):
         state           = torch.FloatTensor(state).unsqueeze(0).to(device).detach()
@@ -327,8 +318,8 @@ class Agent():
         self.policy_optimizer.step()
 
     # Update the model
-    def update_ppo(self):
-        dataloader  = DataLoader(self.policy_memory, self.batchsize, shuffle = False)
+    def update_ppo(self, policy_memory, aux_memory):
+        dataloader  = DataLoader(policy_memory, self.batchsize, shuffle = False)
 
         # Optimize policy for K epochs:
         for _ in range(self.PPO_epochs):
@@ -336,16 +327,18 @@ class Agent():
                 self.training_ppo(states.float().to(device), actions.float().to(device), rewards.float().to(device), dones.float().to(device), next_states.float().to(device))
 
         # Clear the memory
-        states, _, _, _, _ = self.policy_memory.get_all()
-        self.aux_memory.save_all(states)
-        self.policy_memory.clear_memory()
+        states, _, _, _, _ = policy_memory.get_all()
+        aux_memory.save_all(states)
+        policy_memory.clear_memory()
 
         # Copy new weights into old policy:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.value_old.load_state_dict(self.value.state_dict())
 
-    def update_aux(self):
-        dataloader  = DataLoader(self.aux_memory, self.batchsize, shuffle = False)
+        return policy_memory, aux_memory
+
+    def update_aux(self, aux_memory):
+        dataloader  = DataLoader(aux_memory, self.batchsize, shuffle = False)
 
         # Optimize policy for K epochs:
         for _ in range(self.PPO_epochs):       
@@ -353,10 +346,12 @@ class Agent():
                 self.training_aux(states.float().to(device))
 
         # Clear the memory
-        self.aux_memory.clear_memory()
+        aux_memory.clear_memory()
 
         # Copy new weights into old policy:
         self.policy_old.load_state_dict(self.policy.state_dict())
+
+        return aux_memory
 
     def save_weights(self):
         torch.save({
@@ -378,101 +373,96 @@ class Agent():
         self.value.load_state_dict(value_checkpoint['model_state_dict'])
         self.value_optimizer.load_state_dict(value_checkpoint['optimizer_state_dict'])
 
-class VectorEnv:
-    def __init__(self, envs):
-        self.envs = envs
-
-    # Call this only once at the beginning of training (optional):
-    def seed(self, seeds):
-        assert len(self.envs) == len(seeds)
-        return tuple(env.seed(s) for env, s in zip(self.envs, seeds))
-
-    # Call this only once at the beginning of training:
-    def reset(self):
-        return tuple(env.reset() for env in self.envs)
-
-    # Call this on every timestep:
-    def step(self, actions):
-        assert len(self.envs) == len(actions)
-
-        return_values = []
-        for env, a in zip(self.envs, actions):
-            observation, reward, done, info = env.step(a)
-            if done:
-                observation = env.reset()
-            return_values.append((observation, reward, done, info))
-            
-        return tuple(return_values)
-
-    def render(self):
-        for env in self.envs:
-            env.render()
-
-    # Call this at the end of training:
-    def close(self):
-        for env in self.envs:
-            env.close()
-
 class Runner():
-    def __init__(self, envs, agent, render, training_mode, n_update, n_aux_update, max_action):
-        self.envs       = VectorEnv(envs)
-        self.memories   = [PolicyMemory() for _ in range(len(envs))]
+    def __init__(self, env, agent, render, training_mode, n_update, n_aux_update, max_action):
+        self.env = env
+        self.agent = agent
+        self.render = render
+        self.training_mode = training_mode
+        self.n_update = n_update
+        self.n_aux_update = n_aux_update
+        self.max_action = max_action
 
-        self.agent          = agent
-        self.render         = render
-        self.training_mode  = training_mode
-        self.n_update       = n_update
-        self.n_aux_update   = n_aux_update
-        self.max_action     = max_action
+        self.t_updates = 0
+        self.t_aux_updates = 0
 
-        self.t_updates      = 0
-        self.t_aux_updates  = 0
+        self.env.reset()
+        self.behavior_name      = list(self.env.behavior_specs)[0]
+        decision_steps, _       = self.env.get_steps(self.behavior_name)
+        self.tracked_agents     = decision_steps.agent_id
+
+        self.policy_memories    = {}
+        self.aux_memories       = AuxMemory()
+        for agent_id in self.tracked_agents:
+            self.policy_memories[agent_id]  = PolicyMemory()
 
     def run_episode(self):
+        self.env.reset()
+        decisionSteps, _    = self.env.get_steps(self.behavior_name)
+
+        states = {}
+        for agent_id in decisionSteps.agent_id:
+            states[agent_id] = decisionSteps[agent_id].obs[0]
         ############################################
-        states          = self.envs.reset()    
-        done            = False
-        total_reward    = 0
-        eps_time        = 0
-        ############################################ 
+        total_reward = 0
+        eps_time = 0
+        ############################################
         for _ in range(self.n_update * self.n_aux_update):
-            actions     = self.agent.act(states) 
+            actions = {}
+            for id, state in states.items():
+                actions[id] = self.agent.act(state)
 
-            action_gym  = np.clip(actions, -1.0, 1.0) * self.max_action
-            datas       = self.envs.step(action_gym)
+            if len(actions) > 0:
+                action_gym  = np.stack([value for key, value in actions.items()])
+                self.env.set_actions(self.behavior_name, action_gym)
 
-            rewards     = []
-            next_states = []
-            for state, action, memory, data in zip(states, actions, self.memories, datas):
-                next_state, reward, done, _ = data
-                rewards.append(reward)
-                next_states.append(next_state)
-                
-                if self.training_mode:
-                    memory.save_eps(state.tolist(), action.tolist(), reward, float(done), next_state.tolist())
+            self.env.step()
+            decisionSteps, terminalSteps = self.env.get_steps(self.behavior_name)
+
+            rewards = {}
+            dones = {}
+            next_states = {}
+            terminated_states = {}
+
+            for agent_id in decisionSteps.agent_id:
+                rewards[agent_id]       = decisionSteps[agent_id].reward
+                dones[agent_id]         = False
+                next_states[agent_id]   = decisionSteps[agent_id].obs[0]            
             
-            eps_time += 1 
-            self.t_updates += 1
-            total_reward += np.mean(rewards)
-                
-            states = next_states            
-                    
-            if self.render:
-                self.envs.render()
-            
-            if self.training_mode and self.n_update is not None and self.t_updates == self.n_update:
-                for memory in self.memories:
-                    temp_states, temp_actions, temp_rewards, temp_dones, temp_next_states = memory.get_all()
-                    self.agent.save_all(temp_states, temp_actions, temp_rewards, temp_dones, temp_next_states)
-                    memory.clear_memory()
+            for agent_id in terminalSteps.agent_id:
+                rewards[agent_id]           = terminalSteps[agent_id].reward
+                dones[agent_id]             = not terminalSteps[agent_id].interrupted
+                terminated_states[agent_id] = terminalSteps[agent_id].obs[0]
 
-                self.agent.update_ppo()
-                self.t_updates = 0
+            eps_time        += 1
+            self.t_updates  += 1
+            total_reward    += np.mean([value for key, value in rewards.items()])
+                            
+            if self.training_mode:
+                for track_agent in self.tracked_agents:
+                    if track_agent in states and track_agent in next_states:
+                        self.policy_memories[track_agent].save_eps(states[track_agent], actions[track_agent].tolist(), rewards[track_agent], float(dones[track_agent]), next_states[track_agent])
+
+                    elif track_agent in states and track_agent in terminated_states:
+                        self.policy_memories[track_agent].save_eps(states[track_agent], actions[track_agent].tolist(), rewards[track_agent], float(dones[track_agent]), terminated_states[track_agent])
+
+            if self.training_mode and self.t_updates == self.n_update:
                 self.t_aux_updates += 1
+                self.t_updates = 0
+                tempMemory = PolicyMemory()
+                
+                for policy_memory in self.policy_memories.values():
+                    tempstates, tempactions, temprewards, tempdones, tempnext_states = policy_memory.get_all()
+                    tempMemory.save_all(tempstates, tempactions, temprewards, tempdones, tempnext_states)
+                    policy_memory.clear_memory()
 
+                tempMemory, self.aux_memories = self.agent.update_ppo(tempMemory, self.aux_memories)
+                
                 if self.t_aux_updates == self.n_aux_update:
-                    self.agent.update_aux()
                     self.t_aux_updates = 0
+                    self.aux_memories = self.agent.update_aux(self.aux_memories)
+
+            states      = next_states
                     
         return total_reward, eps_time
 
@@ -505,7 +495,7 @@ def main():
 
     policy_kl_range     = 0.03 # Set to 0.0008 for Discrete
     policy_params       = 5 # Set to 20 for Discrete
-    value_clip          = 2.0 # How many value will be clipped. Recommended set to the highest or lowest possible reward
+    value_clip          = 1.0 # How many value will be clipped. Recommended set to the highest or lowest possible reward
     entropy_coef        = 0.0 # How much randomness of action you will get
     vf_loss_coef        = 1.0 # Just set to 1
     batchsize           = 32 # How many batch per update. size of batch = n_update / batchsize. Rocommended set to 4 for Discrete
@@ -517,13 +507,21 @@ def main():
     lam                 = 0.95 # Just set to 0.95
     learning_rate       = 3e-4 # Just set to 0.95
     ############################################# 
-    writer              = SummaryWriter()
+    #env_id              = '3DBall'
+    #env                = default_registry[env_id].make()
+    env                 = UnityEnvironment(file_name = None, seed = 1)
 
-    env_name            = 'BipedalWalker-v3' # Set the env you want
-    env                 = [gym.make(env_name) for _ in range(2)]
+    env.reset()
+    behavior_name       = list(env.behavior_specs)[0]
+    behavior_spec       = env.behavior_specs[behavior_name]
 
-    state_dim           = env[0].observation_space.shape[0]
-    action_dim          = env[0].action_space.shape[0]
+    print(behavior_spec)
+
+    state_dim           = behavior_spec.observation_shapes[0][0]
+    action_dim          = behavior_spec.action_size
+
+    print('state_dim: ', state_dim)
+    print('action_dim: ', action_dim)
 
     agent               = Agent(state_dim, action_dim, training_mode, policy_kl_range, policy_params, value_clip, entropy_coef, vf_loss_coef,
                             batchsize, PPO_epochs, gamma, lam, learning_rate)  
@@ -538,22 +536,68 @@ def main():
         agent.load_weights()
         print('Weight Loaded')
 
-    start = time.time()
+    rewards             = []   
+    batch_rewards       = []
+    batch_solved_reward = []
 
-    try:
-        for i_episode in range(1, n_episode + 1):
-            total_reward, eps_time = runner.run_episode()
+    times               = []
+    batch_times         = []
 
-            print('Episode: {} \t t_reward: {} \t time: {} \t '.format(i_episode, total_reward, eps_time))
-            writer.add_scalar('rewards', total_reward, i_episode)
+    for i_episode in range(1, n_episode + 1):
+        total_reward, time = runner.run_episode()
 
-    except KeyboardInterrupt:        
-        print('\nTraining has been Shutdown \n')
+        print('Episode {} \t t_reward: {} \t time: {} \t '.format(i_episode, total_reward, time))
+        batch_rewards.append(int(total_reward))
+        batch_times.append(time)        
 
-    finally:
-        finish = time.time()
-        timedelta = finish - start
-        print('Timelength: {}'.format(str( datetime.timedelta(seconds = timedelta) )))
+        if save_weights:
+            if i_episode % n_saved == 0:
+                agent.save_weights() 
+                print('weights saved')
+
+        if reward_threshold:
+            if len(batch_solved_reward) == 100:            
+                if np.mean(batch_solved_reward) >= reward_threshold:
+                    print('You solved task after {} episode'.format(len(rewards)))
+                    break
+
+                else:
+                    del batch_solved_reward[0]
+                    batch_solved_reward.append(total_reward)
+
+            else:
+                batch_solved_reward.append(total_reward)
+
+        if i_episode % n_plot_batch == 0 and i_episode != 0:
+            # Plot the reward, times for every n_plot_batch
+            plot(batch_rewards)
+            plot(batch_times)
+
+            for reward in batch_rewards:
+                rewards.append(reward)
+
+            for time in batch_times:
+                times.append(time)
+
+            batch_rewards   = []
+            batch_times     = []
+
+            print('========== Cummulative ==========')
+            # Plot the reward, times for every episode
+            plot(rewards)
+            plot(times)
+
+    print('========== Final ==========')
+    # Plot the reward, times for every episode
+
+    for reward in batch_rewards:
+        rewards.append(reward)
+
+    for time in batch_times:
+        times.append(time)
+
+    plot(rewards)
+    plot(times)
 
 if __name__ == '__main__':
     main()

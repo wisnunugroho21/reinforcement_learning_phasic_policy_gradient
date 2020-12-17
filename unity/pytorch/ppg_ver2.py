@@ -16,6 +16,8 @@ import numpy
 import time
 import datetime
 
+from mlagents_envs.environment import UnityEnvironment
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  
 dataType = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
 
@@ -283,7 +285,7 @@ class Agent():
         self.policy_memory.save_all(states, actions, rewards, dones, next_states)
 
     def act(self, state):
-        state           = torch.FloatTensor(state).unsqueeze(0).to(device).detach()
+        state           = torch.FloatTensor(state).to(device).detach()
         action_mean, _  = self.policy(state)
         
         # We don't need sample the action in Test Mode
@@ -294,7 +296,7 @@ class Agent():
         else:
             action  = action_mean  
               
-        return action.squeeze(0).cpu().numpy()
+        return action.cpu().numpy()
 
     # Get loss and Do backpropagation
     def training_ppo(self, states, actions, rewards, dones, next_states):
@@ -380,43 +382,61 @@ class Agent():
 
 class VectorEnv:
     def __init__(self, envs):
-        self.envs = envs
+        self.envs               = envs
 
-    # Call this only once at the beginning of training (optional):
-    def seed(self, seeds):
-        assert len(self.envs) == len(seeds)
-        return tuple(env.seed(s) for env, s in zip(self.envs, seeds))
+        self.envs.reset()
+        self.behavior_name      = list(self.envs.behavior_specs)[0]
+
+        decision_steps, _       = self.envs.get_steps(self.behavior_name)
+        behavior_spec           = self.envs.behavior_specs[self.behavior_name]
+
+        self.tracked_agents     = decision_steps.agent_id
+        self.state_dim          = behavior_spec.observation_shapes[0][0]
+        self.action_dim         = behavior_spec.action_spec.continuous_size
 
     # Call this only once at the beginning of training:
     def reset(self):
-        return tuple(env.reset() for env in self.envs)
+        self.envs.reset()
+        decisionSteps, _    = self.envs.get_steps(self.behavior_name)
+
+        states = {}
+        for agent_id in decisionSteps.agent_id:
+            states[agent_id] = decisionSteps[agent_id].obs[0]
+
+        return states
 
     # Call this on every timestep:
     def step(self, actions):
-        assert len(self.envs) == len(actions)
+        if len(actions) > 0:
+            self.envs.set_actions(self.behavior_name, actions)
 
-        return_values = []
-        for env, a in zip(self.envs, actions):
-            observation, reward, done, info = env.step(a)
-            if done:
-                observation = env.reset()
-            return_values.append((observation, reward, done, info))
-            
-        return tuple(return_values)
+        self.envs.step()
+        decisionSteps, terminalSteps    = self.envs.get_steps(self.behavior_name)
 
-    def render(self):
-        for env in self.envs:
-            env.render()
+        rewards = {}
+        dones = {}
+        next_states = {}
+        terminated_states = {}
 
-    # Call this at the end of training:
-    def close(self):
-        for env in self.envs:
-            env.close()
+        for agent_id in decisionSteps.agent_id:
+            rewards[agent_id]           = decisionSteps[agent_id].reward
+            dones[agent_id]             = False
+            next_states[agent_id]       = decisionSteps[agent_id].obs[0]            
+        
+        for agent_id in terminalSteps.agent_id:
+            rewards[agent_id]           = terminalSteps[agent_id].reward
+            dones[agent_id]             = not terminalSteps[agent_id].interrupted
+            terminated_states[agent_id] = terminalSteps[agent_id].obs[0]
+
+        return rewards, dones, next_states, terminated_states
 
 class Runner():
     def __init__(self, envs, agent, render, training_mode, n_update, n_aux_update, max_action):
-        self.envs       = VectorEnv(envs)
-        self.memories   = [PolicyMemory() for _ in range(len(envs))]
+        self.envs               = envs
+
+        self.policy_memories    = {}
+        for agent_id in self.envs.tracked_agents:
+            self.policy_memories[agent_id]  = PolicyMemory()
 
         self.agent          = agent
         self.render         = render
@@ -430,38 +450,33 @@ class Runner():
 
     def run_episode(self):
         ############################################
-        states          = self.envs.reset()    
-        done            = False
+        states          = self.envs.reset()
         total_reward    = 0
-        eps_time        = 0
+        eps_time        = 0        
         ############################################ 
         for _ in range(self.n_update * self.n_aux_update):
-            actions     = self.agent.act(states) 
+            action_gym = []
+            if len(states) > 0:
+                actions     = self.agent.act([value for key, value in states.items()])
+                action_gym  = np.clip(actions, -1.0, 1.0) * self.max_action
+            rewards, dones, next_states, terminated_states  = self.envs.step(action_gym)
 
-            action_gym  = np.clip(actions, -1.0, 1.0) * self.max_action
-            datas       = self.envs.step(action_gym)
+            if self.training_mode:
+                for track_agent in self.envs.tracked_agents:
+                    if track_agent in states and track_agent in next_states:
+                        self.policy_memories[track_agent].save_eps(states[track_agent], actions[track_agent].tolist(), rewards[track_agent], float(dones[track_agent]), next_states[track_agent])
 
-            rewards     = []
-            next_states = []
-            for state, action, memory, data in zip(states, actions, self.memories, datas):
-                next_state, reward, done, _ = data
-                rewards.append(reward)
-                next_states.append(next_state)
-                
-                if self.training_mode:
-                    memory.save_eps(state.tolist(), action.tolist(), reward, float(done), next_state.tolist())
+                    elif track_agent in states and track_agent in terminated_states:
+                        self.policy_memories[track_agent].save_eps(states[track_agent], actions[track_agent].tolist(), rewards[track_agent], float(dones[track_agent]), terminated_states[track_agent])
             
-            eps_time += 1 
-            self.t_updates += 1
-            total_reward += np.mean(rewards)
+            eps_time        += 1 
+            self.t_updates  += 1
+            total_reward    += np.mean([value for key, value in rewards.items()])
                 
-            states = next_states            
-                    
-            if self.render:
-                self.envs.render()
-            
+            states = next_states
+                                
             if self.training_mode and self.n_update is not None and self.t_updates == self.n_update:
-                for memory in self.memories:
+                for memory in self.policy_memories.values():
                     temp_states, temp_actions, temp_rewards, temp_dones, temp_next_states = memory.get_all()
                     self.agent.save_all(temp_states, temp_actions, temp_rewards, temp_dones, temp_next_states)
                     memory.clear_memory()
@@ -505,7 +520,7 @@ def main():
 
     policy_kl_range     = 0.03 # Set to 0.0008 for Discrete
     policy_params       = 5 # Set to 20 for Discrete
-    value_clip          = 2.0 # How many value will be clipped. Recommended set to the highest or lowest possible reward
+    value_clip          = 5.0 # How many value will be clipped. Recommended set to the highest or lowest possible reward
     entropy_coef        = 0.0 # How much randomness of action you will get
     vf_loss_coef        = 1.0 # Just set to 1
     batchsize           = 32 # How many batch per update. size of batch = n_update / batchsize. Rocommended set to 4 for Discrete
@@ -519,11 +534,14 @@ def main():
     ############################################# 
     writer              = SummaryWriter()
 
-    env_name            = 'BipedalWalker-v3' # Set the env you want
-    env                 = [gym.make(env_name) for _ in range(2)]
+    env                 = UnityEnvironment(file_name = None, seed = 1)
+    env                 = VectorEnv(env)
 
-    state_dim           = env[0].observation_space.shape[0]
-    action_dim          = env[0].action_space.shape[0]
+    state_dim           = env.state_dim
+    action_dim          = env.action_dim
+
+    print('state_dim: ', state_dim)
+    print('action_dim: ', action_dim)
 
     agent               = Agent(state_dim, action_dim, training_mode, policy_kl_range, policy_params, value_clip, entropy_coef, vf_loss_coef,
                             batchsize, PPO_epochs, gamma, lam, learning_rate)  
