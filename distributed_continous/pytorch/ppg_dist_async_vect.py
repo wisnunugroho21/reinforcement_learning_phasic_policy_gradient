@@ -3,7 +3,7 @@ from gym.envs.registration import register
     
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+from torch.distributions import Categorical
 from torch.distributions.kl import kl_divergence
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
@@ -19,34 +19,24 @@ import datetime
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")  
 dataType = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
 
-class Utils():
-    def prepro(self, I):
-        I           = I[35:195] # crop
-        I           = I[::2,::2, 0] # downsample by factor of 2
-        I[I == 144] = 0 # erase background (background type 1)
-        I[I == 109] = 0 # erase background (background type 2)
-        I[I != 0]   = 1 # everything else (paddles, ball) just set to 1
-        X           = I.astype(np.float32).ravel() # Combine items in 1 array 
-        return X
-
 class Policy_Model(nn.Module):
     def __init__(self, state_dim, action_dim):
         super(Policy_Model, self).__init__()
 
         self.nn_layer = nn.Sequential(
-                nn.Linear(state_dim, 256),
+                nn.Linear(state_dim, 1280),
                 nn.ReLU(),
-                nn.Linear(256, 128),
+                nn.Linear(1280, 1280),
                 nn.ReLU()
               ).float().to(device)
 
         self.actor_layer = nn.Sequential(
-                nn.Linear(128, action_dim),
-                nn.Tanh()
+                nn.Linear(1280, action_dim),
+                nn.Softmax(-1)
               ).float().to(device)
 
         self.critic_layer = nn.Sequential(
-                nn.Linear(128, 1)
+                nn.Linear(1280, 1)
               ).float().to(device)
         
     def forward(self, states):
@@ -58,11 +48,11 @@ class Value_Model(nn.Module):
         super(Value_Model, self).__init__()   
 
         self.nn_layer = nn.Sequential(
-                nn.Linear(state_dim, 128),
+                nn.Linear(state_dim, 640),
                 nn.ReLU(),
-                nn.Linear(128, 64),
+                nn.Linear(640, 640),
                 nn.ReLU(),
-                nn.Linear(64, 1)
+                nn.Linear(640, 1)
               ).float().to(device)
         
     def forward(self, states):
@@ -123,24 +113,24 @@ class AuxMemory(Dataset):
     def clear_memory(self):
         del self.states[:]
 
-class Continous():
-    def sample(self, mean, std):
-        distribution    = Normal(mean, std)
+class Discrete():
+    def sample(self, datas):
+        distribution = Categorical(datas)
         return distribution.sample().float().to(device)
         
-    def entropy(self, mean, std):
-        distribution    = Normal(mean, std)    
+    def entropy(self, datas):
+        distribution = Categorical(datas)    
         return distribution.entropy().float().to(device)
       
-    def logprob(self, mean, std, value_data):
-        distribution    = Normal(mean, std)
-        return distribution.log_prob(value_data).float().to(device)
+    def logprob(self, datas, value_data):
+        distribution = Categorical(datas)
+        return distribution.log_prob(value_data).unsqueeze(1).float().to(device)
 
-    def kl_divergence(self, mean1, std1, mean2, std2):
-        distribution1   = Normal(mean1, std1)
-        distribution2   = Normal(mean2, std2)
+    def kl_divergence(self, datas1, datas2):
+        distribution1 = Categorical(datas1)
+        distribution2 = Categorical(datas2)
 
-        return kl_divergence(distribution1, distribution2).float().to(device)  
+        return kl_divergence(distribution1, distribution2).unsqueeze(1).float().to(device)  
 
 class PolicyFunction():
     def __init__(self, gamma = 0.99, lam = 0.95):
@@ -180,26 +170,27 @@ class TrulyPPO():
         self.vf_loss_coef       = vf_loss_coef
         self.entropy_coef       = entropy_coef
 
-        self.distributions      = Continous()
+        self.distributions      = Discrete()
         self.policy_function    = PolicyFunction(gamma, lam)
 
-    def compute_loss(self, action_mean, action_std, old_action_mean, old_action_std, values, old_values, next_values, actions, rewards, dones):    
+    # Loss for PPO  
+    def compute_loss(self, action_probs, old_action_probs, values, old_values, next_values, actions, rewards, dones):
         # Don't use old value in backpropagation
         Old_values          = old_values.detach()
-        Old_action_mean     = old_action_mean.detach()
+        Old_action_probs    = old_action_probs.detach()     
 
         # Getting general advantages estimator and returns
         Advantages      = self.policy_function.generalized_advantage_estimation(values, rewards, next_values, dones)
         Returns         = (Advantages + values).detach()
-        Advantages      = ((Advantages - Advantages.mean()) / (Advantages.std() + 1e-6)).detach() 
+        Advantages      = ((Advantages - Advantages.mean()) / (Advantages.std() + 1e-6)).detach()
 
-        # Finding the ratio (pi_theta / pi_theta__old):      
-        logprobs        = self.distributions.logprob(action_mean, action_std, actions)
-        Old_logprobs    = self.distributions.logprob(Old_action_mean, old_action_std, actions).detach() 
+        # Finding the ratio (pi_theta / pi_theta__old): 
+        logprobs        = self.distributions.logprob(action_probs, actions)
+        Old_logprobs    = self.distributions.logprob(Old_action_probs, actions).detach()
 
         # Finding Surrogate Loss
         ratios          = (logprobs - Old_logprobs).exp() # ratios = old_logprobs / logprobs        
-        Kl              = self.distributions.kl_divergence(Old_action_mean, old_action_std, action_mean, action_std)
+        Kl              = self.distributions.kl_divergence(old_action_probs, action_probs)
 
         pg_targets  = torch.where(
             (Kl >= self.policy_kl_range) & (ratios > 1),
@@ -208,8 +199,8 @@ class TrulyPPO():
         )
         pg_loss     = pg_targets.mean()
 
-        # Getting entropy from the action probability 
-        dist_entropy    = self.distributions.entropy(action_mean, action_std).mean()
+        # Getting Entropy from the action probability 
+        dist_entropy    = self.distributions.entropy(action_probs).mean()
 
         # Getting Critic loss by using Clipped critic value
         if self.value_clip is None:
@@ -218,7 +209,7 @@ class TrulyPPO():
             vpredclipped  = old_values + torch.clamp(values - Old_values, -self.value_clip, self.value_clip) # Minimize the difference between old value and new value
             vf_losses1    = (Returns - values).pow(2) * 0.5 # Mean Squared Error
             vf_losses2    = (Returns - vpredclipped).pow(2) * 0.5 # Mean Squared Error        
-            critic_loss   = torch.max(vf_losses1, vf_losses2).mean()                
+            critic_loss   = torch.max(vf_losses1, vf_losses2).mean() 
 
         # We need to maximaze Policy Loss to make agent always find Better Rewards
         # and minimize Critic Loss 
@@ -227,14 +218,14 @@ class TrulyPPO():
 
 class JointAux():
     def __init__(self):
-        self.distributions  = Continous()
+        self.distributions  = Discrete()
 
-    def compute_loss(self, action_mean, action_std, old_action_mean, old_action_std, values, Returns):
+    def compute_loss(self, action_probs, old_action_probs, values, Returns):
         # Don't use old value in backpropagation
-        Old_action_mean     = old_action_mean.detach()
+        Old_action_probs    = old_action_probs.detach()
 
         # Finding KL Divergence                
-        Kl              = self.distributions.kl_divergence(Old_action_mean, old_action_std, action_mean, action_std).mean()
+        Kl              = self.distributions.kl_divergence(Old_action_probs, action_probs).mean()
         aux_loss        = ((Returns - values).pow(2) * 0.5).mean()
 
         return aux_loss + Kl
@@ -250,8 +241,7 @@ class Agent():
         self.batchsize          = batchsize
         self.PPO_epochs         = PPO_epochs
         self.is_training_mode   = is_training_mode
-        self.action_dim         = action_dim
-        self.std                = torch.ones([1, action_dim]).float().to(device)
+        self.action_dim         = action_dim     
 
         self.policy             = Policy_Model(state_dim, action_dim)
         self.policy_old         = Policy_Model(state_dim, action_dim)
@@ -267,7 +257,7 @@ class Agent():
         self.aux_memory         = AuxMemory()
         self.aux_loss           = JointAux()
          
-        self.distributions      = Continous()
+        self.distributions      = Discrete()        
 
         if is_training_mode:
           self.policy.train()
@@ -284,27 +274,27 @@ class Agent():
 
     def act(self, state):
         state           = torch.FloatTensor(state).to(device).detach()
-        action_mean, _  = self.policy(state)
-        
+        action_probs, _ = self.policy(state)
+
         # We don't need sample the action in Test Mode
         # only sampling the action in Training Mode in order to exploring the actions
         if self.is_training_mode:
             # Sample the action
-            action  = self.distributions.sample(action_mean, self.std)
+            action  = self.distributions.sample(action_probs) 
         else:
-            action  = action_mean  
+            action  = torch.argmax(action_probs, 1)  
               
         return action.cpu().numpy()
 
     # Get loss and Do backpropagation
     def training_ppo(self, states, actions, rewards, dones, next_states):
-        action_mean, _      = self.policy(states)
+        action_probs, _     = self.policy(states)
         values              = self.value(states)
-        old_action_mean, _  = self.policy_old(states)
+        old_action_probs, _ = self.policy_old(states)
         old_values          = self.value_old(states)
         next_values         = self.value(next_states)
 
-        loss                = self.policy_loss.compute_loss(action_mean, self.std, old_action_mean, self.std, values, old_values, next_values, actions, rewards, dones)
+        loss                = self.policy_loss.compute_loss(action_probs, old_action_probs, values, old_values, next_values, actions, rewards, dones)
 
         self.policy_optimizer.zero_grad()
         self.value_optimizer.zero_grad()
@@ -317,10 +307,10 @@ class Agent():
     def training_aux(self, states):
         Returns                         = self.value(states).detach()
 
-        action_mean, values             = self.policy(states)
-        old_action_mean, _              = self.policy_old(states)
+        action_probs, values            = self.policy(states)
+        old_action_probs, _             = self.policy_old(states)
 
-        joint_loss                      = self.aux_loss.compute_loss(action_mean, self.std, old_action_mean, self.std, values, Returns)
+        joint_loss                      = self.aux_loss.compute_loss(action_probs, old_action_probs, values, Returns)
 
         self.policy_optimizer.zero_grad()
         joint_loss.backward()
@@ -328,12 +318,13 @@ class Agent():
 
     # Update the model
     def update_ppo(self):
-        dataloader  = DataLoader(self.policy_memory, self.batchsize, shuffle = False, num_workers = 8, pin_memory = True)
+        dataloader  = DataLoader(self.policy_memory, self.batchsize, shuffle = False)
 
-        # Optimize policy for K epochs:
+        # Optimize policy for K epochs:        
         for _ in range(self.PPO_epochs):
             for states, actions, rewards, dones, next_states in dataloader:
-                self.training_ppo(states.float().to(device), actions.float().to(device), rewards.float().to(device), dones.float().to(device), next_states.float().to(device))
+                self.training_ppo(states.float().to(device), actions.float().to(device), \
+                    rewards.float().to(device), dones.float().to(device), next_states.float().to(device))
 
         # Clear the memory
         states, _, _, _, _ = self.policy_memory.get_all()
@@ -345,10 +336,10 @@ class Agent():
         self.value_old.load_state_dict(self.value.state_dict())
 
     def update_aux(self):
-        dataloader  = DataLoader(self.aux_memory, self.batchsize, shuffle = False, num_workers = 8, pin_memory = True)
+        dataloader  = DataLoader(self.aux_memory, self.batchsize, shuffle = False)
 
         # Optimize policy for K epochs:
-        for _ in range(self.PPO_epochs):       
+        for _ in range(self.PPO_epochs): 
             for states in dataloader:
                 self.training_aux(states.float().to(device))
 
@@ -362,21 +353,30 @@ class Agent():
         torch.save({
             'model_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.policy_optimizer.state_dict()
-            }, 'SlimeVolley/policy.tar')
+            }, 'Pong/policy.tar')
         
         torch.save({
             'model_state_dict': self.value.state_dict(),
             'optimizer_state_dict': self.value_optimizer.state_dict()
-            }, 'SlimeVolley/value.tar')
+            }, 'Pong/value.tar')
         
     def load_weights(self):
-        policy_checkpoint = torch.load('SlimeVolley/policy.tar')
+        policy_checkpoint = torch.load('Pong/policy.tar')
         self.policy.load_state_dict(policy_checkpoint['model_state_dict'])
         self.policy_optimizer.load_state_dict(policy_checkpoint['optimizer_state_dict'])
 
-        value_checkpoint = torch.load('SlimeVolley/value.tar')
+        value_checkpoint = torch.load('Pong/value.tar')
         self.value.load_state_dict(value_checkpoint['model_state_dict'])
         self.value_optimizer.load_state_dict(value_checkpoint['optimizer_state_dict'])
+
+def prepro(I):
+    I           = I[35:195] # crop
+    I           = I[::2,::2, 0] # downsample by factor of 2
+    I[I == 144] = 0 # erase background (background type 1)
+    I[I == 109] = 0 # erase background (background type 2)
+    I[I != 0]   = 1 # everything else (paddles, ball) just set to 1
+    X           = I.astype(np.float32).ravel() # Combine items in 1 array 
+    return X
 
 class VectorEnv:
     def __init__(self, envs):
@@ -430,23 +430,31 @@ class Runner():
 
     def run_episode(self):
         ############################################
-        states          = self.envs.reset()    
+        obs             = self.envs.reset()  
+        obs             = [prepro(ob) for ob in obs]  
+        states          = obs
+
         done            = False
         total_reward    = 0
         eps_time        = 0
         ############################################ 
         for _ in range(self.n_update * self.n_aux_update):
-            actions     = self.agent.act(states) 
+            actions     = self.agent.act(states)
+            actions_gym = [int(action) + 1 if action != 0 else 0 for action in actions] 
 
-            action_gym  = np.clip(actions, -1.0, 1.0) * self.max_action
-            datas       = self.envs.step(action_gym)
+            datas       = self.envs.step(actions_gym)
 
             rewards     = []
             next_states = []
-            for state, action, memory, data in zip(states, actions, self.memories, datas):
-                next_state, reward, done, _ = data
+            next_obs    = []
+            for state, action, memory, data, ob in zip(states, actions, self.memories, datas, obs):
+                next_ob, reward, done, _    = data
+                next_ob                     = prepro(next_ob)
+                next_state                  = next_ob - ob
+
                 rewards.append(reward)
                 next_states.append(next_state)
+                next_obs.append(next_ob)
                 
                 if self.training_mode:
                     memory.save_eps(state.tolist(), action.tolist(), reward, float(done), next_state.tolist())
@@ -455,7 +463,8 @@ class Runner():
             self.t_updates += 1
             total_reward += np.mean(rewards)
                 
-            states = next_states            
+            states = next_states
+            obs = next_obs            
                     
             if self.render:
                 self.envs.render()
@@ -491,25 +500,25 @@ def plot(datas):
 
 def main():
     ############## Hyperparameters ##############
-    load_weights        = False # If you want to load the agent, set this to True
-    save_weights        = False # If you want to save the agent, set this to True
+    load_weights        = True # If you want to load the agent, set this to True
+    save_weights        = True # If you want to save the agent, set this to True
     training_mode       = True # If you want to train the agent, set this to True. But set this otherwise if you only want to test it
     reward_threshold    = 300 # Set threshold for reward. The learning will stop if reward has pass threshold. Set none to sei this off
     using_google_drive  = False
 
-    render              = True # If you want to display the image, set this to True. Turn this off if you run this in Google Collab
+    render              = False # If you want to display the image, set this to True. Turn this off if you run this in Google Collab
     n_update            = 1024 # How many episode before you update the Policy. Recommended set to 128 for Discrete
-    n_plot_batch        = 100000000 # How many episode you want to plot the result
+    n_plot_batch        = 1 # How many episode you want to plot the result
     n_episode           = 100000 # How many episode you want to run
     n_saved             = 10 # How many episode to run before saving the weights
 
-    policy_kl_range     = 0.03 # Set to 0.0008 for Discrete
-    policy_params       = 5 # Set to 20 for Discrete
+    policy_kl_range     = 0.0008 # Set to 0.0008 for Discrete
+    policy_params       = 20 # Set to 20 for Discrete
     value_clip          = 2.0 # How many value will be clipped. Recommended set to the highest or lowest possible reward
-    entropy_coef        = 0.0 # How much randomness of action you will get
+    entropy_coef        = 0.05 # How much randomness of action you will get
     vf_loss_coef        = 1.0 # Just set to 1
     batchsize           = 32 # How many batch per update. size of batch = n_update / batchsize. Rocommended set to 4 for Discrete
-    PPO_epochs          = 10 # How many epoch per update
+    PPO_epochs          = 4 # How many epoch per update
     n_aux_update        = 5
     max_action          = 1.0
     
@@ -519,11 +528,11 @@ def main():
     ############################################# 
     writer              = SummaryWriter()
 
-    env_name            = 'BipedalWalker-v3' # Set the env you want
+    env_name            = 'PongDeterministic-v4' # Set the env you want
     env                 = [gym.make(env_name) for _ in range(2)]
 
-    state_dim           = env[0].observation_space.shape[0]
-    action_dim          = env[0].action_space.shape[0]
+    state_dim           = 80 * 80 #env[0].observation_space.shape[0]
+    action_dim          = 3 #env[0].action_space.shape[0]
 
     agent               = Agent(state_dim, action_dim, training_mode, policy_kl_range, policy_params, value_clip, entropy_coef, vf_loss_coef,
                             batchsize, PPO_epochs, gamma, lam, learning_rate)  
@@ -538,14 +547,22 @@ def main():
         agent.load_weights()
         print('Weight Loaded')
 
+    print('Run the training!!')
     start = time.time()
 
     try:
         for i_episode in range(1, n_episode + 1):
             total_reward, eps_time = runner.run_episode()
 
-            print('Episode: {} \t t_reward: {} \t time: {} \t '.format(i_episode, total_reward, eps_time))
-            writer.add_scalar('rewards', total_reward, i_episode)
+            print('Episode {} \t t_reward: {} \t time: {} \t '.format(i_episode, total_reward, eps_time))
+
+            if i_episode % n_plot_batch == 0:
+                writer.add_scalar('Rewards', total_reward, i_episode)
+
+            if save_weights:
+                if i_episode % n_saved == 0:
+                    agent.save_weights() 
+                    print('weights saved')
 
     except KeyboardInterrupt:        
         print('\nTraining has been Shutdown \n')
