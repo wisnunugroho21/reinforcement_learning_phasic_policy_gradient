@@ -17,7 +17,7 @@ Although it's not required, but i recommend run this project on a PC with GPU an
 
 ### Prerequisites
 
-Make sure you have installed Pytorch and Gym.  
+Make sure you have installed Gym.  
 - Click [here](https://gym.openai.com/docs/) to install gym
 
 You can use either Pytorch or Tensorflow 2
